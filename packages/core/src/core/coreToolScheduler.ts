@@ -2616,7 +2616,7 @@ export class CoreToolScheduler {
     }
   }
 
-  /** Suggests similar tool names using Levenshtein distance. */
+  /** Suggests tool names by registered-name prefix, then Levenshtein distance. */
   private getToolSuggestion(unknownToolName: string, topN = 3): string {
     const allToolNames = this.toolRegistry
       .getAllToolNames()
