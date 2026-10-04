@@ -8,6 +8,9 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.net.URI;
@@ -22,8 +25,10 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.DisabledOnOs;
+import org.junit.jupiter.api.condition.EnabledOnOs;
 import org.junit.jupiter.api.condition.OS;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -258,6 +263,87 @@ class DurableLocalProcessRuntimeProvisionerTest {
     }
 
     @Test
+    @EnabledOnOs(OS.LINUX)
+    void registeredZombieIsRetiredPromptlyWithoutReplacementOrStopEvidence() throws Exception {
+        Process parent;
+        try {
+            parent = new ProcessBuilder("python3", "-c", """
+                import os, sys
+                pid = os.fork()
+                if pid == 0:
+                    os._exit(0)
+                try:
+                    os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+                    print(pid, flush=True)
+                    sys.stdin.read()
+                finally:
+                    os.waitpid(pid, 0)
+                """).redirectError(ProcessBuilder.Redirect.INHERIT).start();
+        } catch (IOException unavailable) {
+            Assumptions.assumeTrue(false, "Linux zombie fixture requires python3: " + unavailable);
+            return;
+        }
+        try {
+            var output = new BufferedReader(new InputStreamReader(parent.getInputStream()));
+            String pidLine = CompletableFuture.supplyAsync(() -> {
+                try {
+                    return output.readLine();
+                } catch (IOException error) {
+                    throw new java.util.concurrent.CompletionException(error);
+                }
+            }).get(5, TimeUnit.SECONDS);
+            long pid = Long.parseLong(pidLine);
+            var worker = ProcessHandle.of(pid).orElseThrow();
+            assertTrue(worker.isAlive(), "the unreaped child must exercise ProcessHandle's zombie case");
+            String started = LocalRuntimeStore.startIdentity(worker);
+            assertNotNull(started);
+            var request = request(true);
+            var store = store();
+            Path spawned = directory.resolve("replacement-spawned");
+            var command = List.of("node", "-e",
+                    "require('node:fs').writeFileSync(process.argv[1], 'spawned')", spawned.toString());
+            try (var provisioner = new LocalProcessRuntimeProvisioner(command, directory,
+                    TRANSPORT, ignored -> "storage:a", store)) {
+                var handle = await(provisioner.ensureResource(request, SEED, null));
+                store.locked(request, SEED, handle, false, (resource, record) -> {
+                    resource.createReady();
+                    resource.save(new LocalRuntimeStore.Registration(handle, LocalRuntimeStore.State.REGISTERED,
+                            pid, started, null));
+                    return null;
+                });
+                assertTrue(registration(store, request, handle).processAbsent());
+                long start = System.nanoTime();
+                var failure = assertThrows(java.util.concurrent.ExecutionException.class,
+                        () -> await(provisioner.provision(request, SEED)));
+                var error = (RuntimeBrokerException) failure.getCause();
+                assertEquals("runtime_broker_recovery_blocked", error.getCode());
+                assertEquals(409, error.getStatusCode());
+                assertFalse(error.isRetryable());
+                assertTrue(Duration.ofNanos(System.nanoTime() - start).compareTo(Duration.ofSeconds(5)) < 0,
+                        "a known zombie must not consume the ready timeout");
+                var retired = registration(store, request, handle);
+                assertEquals(LocalRuntimeStore.State.RETIRED, retired.state());
+                assertEquals(handle, retired.handle());
+                assertEquals(pid, retired.pid());
+                assertEquals(started, retired.started());
+                assertNull(retired.endpoint());
+                assertBlocked(provisioner.provision(request, SEED));
+                assertBlocked(provisioner.ensureResource(request(false), SEED, handle));
+                var observed = await(provisioner.reconcile(request, SEED, handle, null));
+                assertEquals(RuntimeObservation.Outcome.CONFLICT, observed.getOutcome());
+                assertNull(observed.getLossEvidence());
+                assertNull(observed.getStopEvidence());
+                assertFalse(Files.exists(spawned), "neither adoption nor retry may launch a replacement");
+                assertTrue(parent.isAlive(), "keep the zombie unreaped until all assertions finish");
+            }
+        } finally {
+            parent.getOutputStream().close();
+            assertTrue(parent.waitFor(5, TimeUnit.SECONDS), "fixture parent must reap its child and exit");
+            assertEquals(0, parent.exitValue());
+        }
+    }
+
+    @Test
     void pidReuseDoesNotKillTheUnrelatedProcessOrProveWritersStopped() throws Exception {
         var request = request(false);
         var store = store();
@@ -437,11 +523,21 @@ class DurableLocalProcessRuntimeProvisionerTest {
         Files.setPosixFilePermissions(directory, PosixFilePermissions.fromString("rwxr-xr-x"));
         assertThrows(IllegalStateException.class, this::store);
         assertThrows(IllegalArgumentException.class, () -> new LocalRuntimeStore.HostIdentity("unknown", HOST.bootId(), HOST.pidNamespace(), HOST.timeNamespace()));
-        if (!"Linux".equals(System.getProperty("os.name"))) {
+    }
+
+    @Test
+    void discoversHostIdentityOnlyWhenAllRequiredLinuxInputsAreAvailable() throws Exception {
+        LocalRuntimeStore.HostIdentity expected;
+        try {
+            expected = new LocalRuntimeStore.HostIdentity(Files.readString(Path.of("/etc/machine-id")).strip(),
+                    Files.readString(Path.of("/proc/sys/kernel/random/boot_id")).strip(),
+                    Files.readSymbolicLink(Path.of("/proc/self/ns/pid")).toString(),
+                    Files.readSymbolicLink(Path.of("/proc/self/ns/time")).toString());
+        } catch (IOException | IllegalArgumentException unavailable) {
             assertThrows(IllegalStateException.class, LocalRuntimeStore.HostIdentity::linux);
-        } else {
-            assertNotNull(LocalRuntimeStore.HostIdentity.linux());
+            return;
         }
+        assertEquals(expected, LocalRuntimeStore.HostIdentity.linux());
     }
 
     @Test
